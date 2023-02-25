@@ -1232,47 +1232,80 @@ pub fn hover(cx: &mut Context) {
 }
 
 pub fn rename_symbol(cx: &mut Context) {
-    let (view, doc) = current_ref!(cx.editor);
-    let text = doc.text().slice(..);
-    let primary_selection = doc.selection(view.id).primary();
-    let prefill = if primary_selection.len() > 1 {
-        primary_selection
-    } else {
-        use helix_core::textobject::{textobject_word, TextObject};
-        textobject_word(text, primary_selection, TextObject::Inside, 1, false)
-    }
-    .fragment(text)
-    .into();
-    ui::prompt_with_input(
-        cx,
-        "rename-to:".into(),
-        prefill,
-        None,
-        ui::completers::none,
-        move |cx: &mut compositor::Context, input: &str, event: PromptEvent| {
-            if event != PromptEvent::Validate {
-                return;
-            }
+    let (view, doc) = current!(cx.editor);
+    let language_server = language_server!(cx.editor, doc);
+    let offset_encoding = language_server.offset_encoding();
 
-            let (view, doc) = current!(cx.editor);
-            let language_server = language_server!(cx.editor, doc);
-            let offset_encoding = language_server.offset_encoding();
+    let pos = doc.position(view.id, offset_encoding);
 
-            let pos = doc.position(view.id, offset_encoding);
+    let future = match language_server.prepare_rename(doc.identifier(), pos) {
+        Some(future) => future,
+        None => {
+            // TODO: fall back to "default behavior" (i.e. use word textobject).
+            cx.editor
+                .set_error("Language server does not support rename preparation");
+            return;
+        }
+    };
 
-            let future =
-                match language_server.rename_symbol(doc.identifier(), pos, input.to_string()) {
-                    Some(future) => future,
-                    None => {
-                        cx.editor
-                            .set_error("Language server does not support symbol renaming");
+    cx.callback(
+        future,
+        move |editor, compositor, response: Option<lsp::PrepareRenameResponse>| {
+            let prefill = match response {
+                Some(lsp::PrepareRenameResponse::Range(range)) => {
+                    let text = doc!(editor).text();
+                    lsp_range_to_range(text, range, offset_encoding)
+                        .expect("lsp sent bad range")
+                        .fragment(text.slice(..))
+                        .into()
+                }
+                Some(lsp::PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. }) => {
+                    placeholder
+                }
+                // TODO: fall back to "default behavior" (i.e. use word textobject).
+                Some(lsp::PrepareRenameResponse::DefaultBehavior { .. }) => unimplemented!(),
+                None => {
+                    editor.set_error("No response :(");
+                    return;
+                }
+            };
+
+            let prompt = ui::Prompt::new(
+                "rename-to:".into(),
+                None,
+                ui::completers::none,
+                move |cx: &mut compositor::Context, input: &str, event: PromptEvent| {
+                    if event != PromptEvent::Validate {
                         return;
                     }
-                };
-            match block_on(future) {
-                Ok(edits) => apply_workspace_edit(cx.editor, offset_encoding, &edits),
-                Err(err) => cx.editor.set_error(err.to_string()),
-            }
+
+                    let (view, doc) = current!(cx.editor);
+                    let language_server = language_server!(cx.editor, doc);
+                    let offset_encoding = language_server.offset_encoding();
+
+                    let pos = doc.position(view.id, offset_encoding);
+
+                    let future = match language_server.rename_symbol(
+                        doc.identifier(),
+                        pos,
+                        input.to_string(),
+                    ) {
+                        Some(future) => future,
+                        None => {
+                            cx.editor
+                                .set_error("Language server does not support symbol renaming");
+                            return;
+                        }
+                    };
+                    match block_on(future) {
+                        Ok(edits) => apply_workspace_edit(cx.editor, offset_encoding, &edits),
+                        Err(err) => cx.editor.set_error(err.to_string()),
+                    }
+                },
+            )
+            .with_line(prefill, editor);
+
+            compositor.push(Box::new(prompt));
         },
     );
 }
